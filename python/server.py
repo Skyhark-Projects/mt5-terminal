@@ -266,7 +266,15 @@ def onMeta(res):
   if "sym" in res:
     symbols = res["sym"]
 
+# Handle history notifications from MT5
+def onHistoryNotification(res):
+  print("received history")
+  print(res)
+
 pipe.onCommand("meta", onMeta)
+pipe.onCommand("history", onHistoryNotification)
+
+#-----
 
 # Handle MT5 http endpoint to receive requests and creates a communication channel between python and MT5
 @app.route('/meta-update', methods = ['POST'])

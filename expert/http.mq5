@@ -11,7 +11,12 @@
 #include <Json.mqh>
 #include <Trade\Trade.mqh>
 
+int historyCount = 0;
+
 int OnInit() {
+   HistorySelect(0, TimeCurrent());
+   historyCount = HistoryDealsTotal();
+
    EventSetTimer(1);
    notifyData();
    return(INIT_SUCCEEDED);
@@ -30,17 +35,21 @@ void OnTick() {
    // Handle trailing tp's
    for(int x=0; x<trailing_tps.Size(); x++) {
       CJAVal tp = trailing_tps[x];
+      double trigger = tp["trigger"].ToDbl();
+      if(trigger == 0)
+         continue;
+
       if(tp["is_long"].ToBool()) {
          // Long
          double current_price = SymbolInfoDouble(tp["symbol"].ToStr(), SYMBOL_BID);
          double triggeredRate = -1;
 
-         if(current_price >= tp["trigger"].ToDbl()) {
+         if(current_price >= trigger) {
             tp["trigger"]   = current_price;
             tp["triggered"] = true;
             triggeredRate   = current_price;
          } else if(tp.HasKey("triggered") && tp["triggered"].ToBool()) {
-            triggeredRate = tp["trigger"].ToDbl();
+            triggeredRate = trigger;
          }
 
          if(triggeredRate != -1 && current_price <= triggeredRate-tp["offset"].ToDbl()) {
@@ -52,12 +61,12 @@ void OnTick() {
          double current_price = SymbolInfoDouble(tp["symbol"].ToStr(), SYMBOL_ASK);
          double triggeredRate = -1;
 
-         if(current_price <= tp["trigger"].ToDbl()) {
+         if(current_price <= trigger) {
             tp["trigger"]   = current_price;
             tp["triggered"] = true;
             triggeredRate   = current_price;
          } else if(tp.HasKey("triggered") && tp["triggered"].ToBool()) {
-            triggeredRate = tp["trigger"].ToDbl();
+            triggeredRate = trigger;
          }
 
          if(triggeredRate != -1 && current_price >= triggeredRate+tp["offset"].ToDbl()) {
@@ -81,6 +90,24 @@ void OnTrade() {
    }
 
    trailing_tps.Set(n);
+
+   // Add new history orders to notifications
+   HistorySelect(0, TimeCurrent());
+   int count = HistoryDealsTotal();
+   if(historyCount < count) {
+      for(;historyCount<count; historyCount++) {
+         int ticket = int(HistoryDealGetTicket(historyCount));
+         if (HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+            continue;
+
+         // Add notification command
+         CJAVal metaCommand;
+         metaCommand["action"] = "history";
+         metaCommand["data"].Set( HistoryItem(ticket) );
+
+         commands.Add(metaCommand);
+      }
+   }
 
    // Notify new data to python
    notifyData();
@@ -145,6 +172,7 @@ void PositionsJSON(CJAVal &data) {
 CJAVal HistoryItem(int ticket) {
    CJAVal position;
    position["id"]           = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+   position["ticket"]       = ticket;
    position["magic"]        = HistoryDealGetInteger(ticket, DEAL_MAGIC);
    position["symbol"]       = HistoryDealGetString(ticket, DEAL_SYMBOL);
    position["type"]         = EnumToString(ENUM_POSITION_TYPE(HistoryDealGetInteger(ticket, DEAL_TYPE)));
@@ -160,7 +188,7 @@ CJAVal HistoryItem(int ticket) {
 CJAVal History(CJAVal &data, int limit) {
    CJAVal info;
 
-   HistorySelect(0,TimeCurrent());
+   HistorySelect(0, TimeCurrent());
 
    // Get positions  
    int positionsTotal = HistoryDealsTotal();
@@ -220,10 +248,9 @@ double transformVolume(CJAVal &pos) {
 
 CJAVal result_to_json(MqlTradeResult &result) {
    CJAVal info;
-   info["id"] = int(result.request_id);
+   info["id"] = int(result.order);
    info["code"] = int(result.retcode);
    info["deal"] = int(result.deal);
-   info["order"] = int(result.order);
    info["volume"] = result.volume;
    info["price"] = result.price;
    info["comment"] = result.comment;
@@ -236,7 +263,7 @@ CJAVal Buy(CJAVal &pos) {
    MqlTradeResult  result={0};
    //--- parameters of request
    request.action   = TRADE_ACTION_DEAL;                     // type of trade operation
-   
+
    request.symbol   = pos["symbol"].ToStr();                 // symbol
    request.volume   = transformVolume(pos);                  // volume
    request.type     = ORDER_TYPE_BUY;                        // order type
@@ -254,7 +281,7 @@ CJAVal Buy(CJAVal &pos) {
       request.sl = pos["sl"].ToDbl();
    if(pos.HasKey("tp"))
       request.tp = pos["tp"].ToDbl();
-   
+
    //--- send the request
    if(!OrderSend(request,result))
       PrintFormat("OrderSend error %d",GetLastError());     // if unable to send the request, output the error code
@@ -285,7 +312,7 @@ CJAVal Short(CJAVal &pos) {
    request.magic    = EXPERT_MAGIC;                          // MagicNumber of the order
    request.type_filling = ORDER_FILLING_IOC;
    request.type_time = ORDER_TIME_DAY;
-   
+
    if(pos.HasKey("comment"))
       request.comment = pos["comment"].ToStr();
    if(pos.HasKey("magic"))
@@ -310,8 +337,9 @@ CJAVal Short(CJAVal &pos) {
 
    return resInfo;
 }
- 
+
 CJAVal Close(CJAVal &pos) {
+   int timeBeforeExec = TimeCurrent();
    CTrade trade;
    int id = int(pos["id"].ToInt());
    if(!trade.PositionClose(id)) {
@@ -320,7 +348,8 @@ CJAVal Close(CJAVal &pos) {
       return info;
    }
 
-   return HistoryItem(id);
+   HistorySelect(timeBeforeExec, TimeCurrent());
+   return HistoryItem(int(trade.ResultDeal()));
 }
 
 // Create trailing tp
@@ -338,6 +367,12 @@ CJAVal TrailingTp(CJAVal &data) {
    } else if (!data.HasKey("offset") || !data["offset"].IsNumeric()) {
       info["error"] = "No valid offset provided";
       return info;
+   } else if(data.HasKey("sl") && !data["sl"].IsNumeric()) {
+      info["error"] = "Wrong stop loss provided";
+      return info;
+   } else if(data.HasKey("tp") && !data["tp"].IsNumeric()) {
+      info["error"] = "Wrong take profit provided";
+      return info;
    }
 
    // Select position id and verify if position exists
@@ -347,6 +382,15 @@ CJAVal TrailingTp(CJAVal &data) {
       return info;
    }
 
+   // Attach simple tp / sl
+   if(data.HasKey("sl") || data.HasKey("tp")) {
+      CTrade trade;
+      if(!trade.PositionModify(id, data["sl"].ToDbl(), data["tp"].ToDbl())) {
+         Print("Coud not attach sl/tp to position", id);
+      }
+   }
+
+   // Setup trailing tp
    string symbol   = PositionGetString(POSITION_SYMBOL);
    bool is_long    = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
    data["is_long"] = is_long;
@@ -354,7 +398,7 @@ CJAVal TrailingTp(CJAVal &data) {
 
    // Handle initial trigger value
    // If we don't require to trigger from current timestamp, check if tp already reached in past data
-   if(!data.HasKey("from_current_timestamp") || !data["from_current_timestamp"].ToBool()) {
+   if((!data.HasKey("from_current_timestamp") || !data["from_current_timestamp"].ToBool()) && data["trigger"].ToDbl() != 0) {
       int ellapsed_time = int((TimeCurrent() - PositionGetInteger(POSITION_TIME)) / 60);
 
       if(is_long) {
@@ -406,7 +450,7 @@ CJAVal OnCommand(string action, CJAVal &data) {
       return Close(data);
    } else if(action == "history") {
       return History(data, 250);
-   } else if(action == "trailing_tp") {
+   } else if(action == "tp_sl") {
       return TrailingTp(data);
    }
 
@@ -462,7 +506,7 @@ void notifyData() {
       Print("Error in WebRequest. Error code =",GetLastError());
       return;
    } 
-  
+
    // Parse response
    CJAVal jv;
    jv.Deserialize(result);
