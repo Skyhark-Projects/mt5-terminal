@@ -1,7 +1,8 @@
 from flask import Flask, jsonify, request, abort
 from datetime import datetime
 from pytz import timezone
-from datetime import date, datetime 
+from datetime import date, datetime
+import time 
 import fnmatch
 import json
 import os
@@ -10,6 +11,7 @@ import os
 import imp
 try:
     imp.find_module('MetaTrader5')
+    from MetaTrader5 import *
 
     # connect to MetaTrader 5
     MT5Initialize()
@@ -24,14 +26,13 @@ except ImportError:
 # ----------------------------------------------------------------  
 
 print("Starting up") 
-utc_tz = timezone('UTC') 
+timezone('UTC') 
 app = Flask(__name__)
 
 # https://github.com/khramkov/MQL5-JSON-API/blob/master/Experts/JsonAPI.mq5
 
 symbols = [ "EURUSD", "GBPUSD", "USDCHF", "USDJPY", "USDCAD", "AUDUSD", "EURCHF", "EURJPY", "EURGBP", "EURCAD", "GBPCHF", "GBPJPY", "AUDJPY" ]
 lastmeta = {}
-requestedOrders = {}
 
 # ----------------------------------------------------------------  
 # helpers
@@ -79,17 +80,11 @@ def resolution(time):
 		return MT5_TIMEFRAME_D1
 	return time
 
-def addOrderRequest(type):
+def pipeCommandRequest(type):
   authorized()
   data = json.loads(request.get_data())
-
-  global requestedOrders
-  if type in requestedOrders:
-  	requestedOrders[type].append(data)
-  else:
-  	requestedOrders[type] = [ data ]
-
-  return jsonify(data)
+  res = pipe.send(type, data)
+  return jsonify(res)
 
 # ----------------------------------------------------------------
 
@@ -141,10 +136,11 @@ def get_positions():
   global lastmeta
   return jsonify(lastmeta["pos"])
 
-@app.route('/history')
-def get_history():
+@app.route('/history/<int:start>')
+def get_history(start):
   authorized()
-  return 'Get closed positions history'
+  res = pipe.send("history", { "from": start })
+  return jsonify(res)
 
 @app.route('/balance')
 def get_balance():
@@ -158,18 +154,121 @@ def get_balance():
   	"margin_free": lastmeta["margin_free"],
   }
 
+@app.route('/attach/trailing_tp', methods = ['POST'])
+def attach_trailing_tp():
+  return pipeCommandRequest("trailing_tp")
+
+@app.route('/attach/tp_sl', methods = ['POST'])
+def attach_tp_sl():
+  return pipeCommandRequest("tp_sl")
+
 @app.route('/create/long', methods = ['POST'])
 def create_long():
-  return addOrderRequest("buy")
+  return pipeCommandRequest("buy")
 
 @app.route('/create/short', methods = ['POST'])
 def create_short():
-  return addOrderRequest("short")
+  return pipeCommandRequest("short")
 
 @app.route('/close', methods = ['POST'])
 def close_position():
-  return addOrderRequest("close")
+  return pipeCommandRequest("close")
 
+# ----------------------------------------------------------------
+
+# Create pipe stream that allows commands to be send throught http requests
+# When the MT5 terminals makes an http request to our server, the answer will not be send until the next http request is received or until we wants to send a command to MT5
+class Pipe:
+  commands = []
+  id = 0
+  notifyId = 0
+  _onAction = {}
+  _idRes = {}
+
+  def send(self, action, data):
+    # Create id for command
+    if self.id > 10000:
+      self.id = 1
+    else:
+      self.id = self.id + 1
+
+    reqId = self.id
+
+    # Append command
+    self.commands.append({ "action": action, "data": data, "id": reqId })
+
+    # Wait for command answer
+    while reqId not in self._idRes:
+      time.sleep(0.01)
+
+    # Remove result from buffer and return result
+    res = self._idRes[reqId]
+    del self._idRes[reqId]
+    return res
+
+  # Bind callback to generic action
+  def onCommand(self, action, cb):
+    if action not in self._onAction:
+      self._onAction[action] = [ cb ]
+    else:
+      self._onAction[action].append(cb)
+
+  def _handleCommandAnswer(self, data):
+    # Handle action callbacks
+    if "action" in data and data["action"] in self._onAction:
+      cbs = self._onAction[data["action"]]
+      for cb in cbs:
+        cb(data["data"])
+
+    # Handle command result by id
+    if "id" in data:
+      if "data" in data:
+        self._idRes[data["id"]] = data["data"]
+      else:
+        self._idRes[data["id"]] = {}
+
+  # Handle http request received from MT5 terminal
+  def onNotify(self, data):
+
+    # Assign id to request
+    if self.notifyId > 10000:
+      self.notifyId = 1
+    else:
+      self.notifyId = self.notifyId + 1
+
+    myId = self.notifyId
+
+    # Handle received data (commands anwers)
+    if isinstance(data, list):
+      for key in data:
+        self._handleCommandAnswer(key)
+
+    # Wait till new request has been received or new command is queud
+    count = 0
+    while self.notifyId == myId and len(self.commands) == 0 and count < 70:
+      count = count + 1
+      time.sleep(0.015)    
+
+    # Send commands back to terminal
+    res = jsonify(self.commands)
+    self.commands = []
+
+    return res
+
+pipe = Pipe()
+
+# Handle symbols
+def onMeta(res):
+  global symbols
+  global lastmeta
+
+  lastmeta = res
+  if "sym" in res:
+    symbols = res["sym"]
+
+pipe.onCommand("meta", onMeta)
+
+# Handle MT5 http endpoint to receive requests and creates a communication channel between python and MT5
 @app.route('/meta-update', methods = ['POST'])
 def update_meta():
   if request.remote_addr != "127.0.0.1":
@@ -177,17 +276,8 @@ def update_meta():
   	abort(403)
 
   data = request.get_data()
-  global lastmeta
-
-  lastmeta = json.loads(data[:len(data)-1])
-  if "sym" in lastmeta:
-    global symbols
-    symbols = lastmeta["sym"]
-
-  global requestedOrders
-  res = jsonify(requestedOrders)
-  requestedOrders = {}
-  return res
+  data = json.loads(data[:len(data)-1])
+  return pipe.onNotify(data)
 
 if __name__ == "__main__":
   app.run(host='0.0.0.0')

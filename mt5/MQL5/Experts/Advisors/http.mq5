@@ -11,43 +11,91 @@
 #include <Json.mqh>
 #include <Trade\Trade.mqh>
 
-int OnInit()
-  {
+int OnInit() {
    EventSetTimer(1);
    notifyData();
    return(INIT_SUCCEEDED);
-  }
+}
 //+------------------------------------------------------------------+
 //| Deinitialization function of the expert                          |
 //+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-  {
+void OnDeinit(const int reason) {
    EventKillTimer();
-  }
+}
 //+------------------------------------------------------------------+
 //| "Tick" event handler function                                    |
 //+------------------------------------------------------------------+
-void OnTick()
-  {
+CJAVal trailing_tps;
+void OnTick() {
+   // Handle trailing tp's
+   for(int x=0; x<trailing_tps.Size(); x++) {
+      CJAVal tp = trailing_tps[x];
+      if(tp["is_long"].ToBool()) {
+         // Long
+         double current_price = SymbolInfoDouble(tp["symbol"].ToStr(), SYMBOL_BID);
+         double triggeredRate = -1;
 
-  }
+         if(current_price >= tp["trigger"].ToDbl()) {
+            tp["trigger"]   = current_price;
+            tp["triggered"] = true;
+            triggeredRate   = current_price;
+         } else if(tp.HasKey("triggered") && tp["triggered"].ToBool()) {
+            triggeredRate = tp["trigger"].ToDbl();
+         }
+
+         if(triggeredRate != -1 && current_price <= triggeredRate-tp["offset"].ToDbl()) {
+            Print("Long Trailing TP triggered " + tp["id"].ToStr());
+            Close(tp);
+         }
+      } else {
+         // Short
+         double current_price = SymbolInfoDouble(tp["symbol"].ToStr(), SYMBOL_ASK);
+         double triggeredRate = -1;
+
+         if(current_price <= tp["trigger"].ToDbl()) {
+            tp["trigger"]   = current_price;
+            tp["triggered"] = true;
+            triggeredRate   = current_price;
+         } else if(tp.HasKey("triggered") && tp["triggered"].ToBool()) {
+            triggeredRate = tp["trigger"].ToDbl();
+         }
+
+         if(triggeredRate != -1 && current_price >= triggeredRate+tp["offset"].ToDbl()) {
+            Print("Short Trailing TP triggered " + tp["id"].ToStr());
+            Close(tp);
+         }
+      }
+   }
+}
 //+------------------------------------------------------------------+
 //| "Trade" event handler function                                   |
 //+------------------------------------------------------------------+
-void OnTrade()
-  {
+void OnTrade() {
+   // Remove closed trailing tp's
+   CJAVal n;
+   for(int x=0; x<trailing_tps.Size(); x++) {
+      int id = int(trailing_tps[x]["id"].ToInt());
+      if(PositionSelectByTicket(id)) {
+         n.Add(trailing_tps[x]);
+      }
+   }
+
+   trailing_tps.Set(n);
+
+   // Notify new data to python
    notifyData();
-  }
+}
 //+------------------------------------------------------------------+
 //| "Timer" event handler function                                   |
 //+------------------------------------------------------------------+
-void OnTimer()
-  {
+void OnTimer() {
    notifyData();
-  }
+}
+
 //+------------------------------------------------------------------+
 
-int i = 0;
+int isymbol = 0;
+bool req_history = false;
 void SymbolsJSON(CJAVal &data) {
    int length = SymbolsTotal(false);
    for(int i=0; i<length; i++) {
@@ -73,18 +121,57 @@ void PositionsJSON(CJAVal &data) {
    for(int i=0;i<positionsTotal;i++){
      ResetLastError();
      PositionGetSymbol(i);
-     position["id"]=PositionGetInteger(POSITION_IDENTIFIER);
-     position["magic"]=PositionGetInteger(POSITION_MAGIC);
-     position["symbol"]=PositionGetString(POSITION_SYMBOL);
-     position["type"]=EnumToString(ENUM_POSITION_TYPE(PositionGetInteger(POSITION_TYPE)));
-     position["time_setup"]=PositionGetInteger(POSITION_TIME);
-     position["open"]=PositionGetDouble(POSITION_PRICE_OPEN);
-     position["stoploss"]=PositionGetDouble(POSITION_SL);
-     position["takeprofit"]=PositionGetDouble(POSITION_TP);
-     position["volume"]=PositionGetDouble(POSITION_VOLUME);
+     position["id"]           = PositionGetInteger(POSITION_IDENTIFIER);
+     position["magic"]        = PositionGetInteger(POSITION_MAGIC);
+     position["symbol"]       = PositionGetString(POSITION_SYMBOL);
+     position["type"]         = EnumToString(ENUM_POSITION_TYPE(PositionGetInteger(POSITION_TYPE)));
+     position["time_setup"]   = PositionGetInteger(POSITION_TIME);
+     position["open"]         = PositionGetDouble(POSITION_PRICE_OPEN);
+     position["stoploss"]     = PositionGetDouble(POSITION_SL);
+     position["takeprofit"]   = PositionGetDouble(POSITION_TP);
+     position["volume"]       = PositionGetDouble(POSITION_VOLUME);
+
+     for(int x=0; x<trailing_tps.Size(); x++) {
+      if(trailing_tps[x]["id"].ToInt() == position["id"].ToInt()) {
+         position["trailing_tp"].Set(trailing_tps[x]);
+         break;
+      }
+     }
 
      data["pos"].Add(position);
    }
+}
+
+CJAVal History(CJAVal &data, int limit) {
+   CJAVal info;
+
+   HistorySelect(0,TimeCurrent());
+
+   // Get positions  
+   int positionsTotal=HistoryDealsTotal();
+   if(positionsTotal > limit)
+      positionsTotal = limit;
+
+   // Go through history in a loop
+   for(int i=0;i<positionsTotal;i++){
+     ResetLastError();
+     int ticket = int(HistoryDealGetTicket(i));
+     CJAVal position;
+     position["id"]           = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+     position["magic"]        = HistoryDealGetInteger(ticket, DEAL_MAGIC);
+     position["symbol"]       = HistoryDealGetString(ticket, DEAL_SYMBOL);
+     position["type"]         = EnumToString(ENUM_POSITION_TYPE(HistoryDealGetInteger(ticket, DEAL_TYPE)));
+     position["time_setup"]   = HistoryDealGetInteger(ticket, DEAL_TIME);
+     position["open"]         = HistoryDealGetDouble(ticket, DEAL_PRICE);
+     position["fee"]          = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+     position["profit"]       = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+     position["volume"]       = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+     position["comment"]      = HistoryDealGetString(ticket, DEAL_COMMENT);
+
+     info.Add(position);
+   }
+
+   return info;
 }
 
 /*CJAVal OrdersJSON(){
@@ -119,36 +206,38 @@ void PositionsJSON(CJAVal &data) {
    return data;
 }*/
 
-string NotifyJSONData() {
-   i++;
- 
-   CJAVal info;
-   info["enabled"] = MQLInfoInteger(MQL_TRADE_ALLOWED) && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
-   //info["pos"] = PositionsJSON();
-   PositionsJSON(info);
-   BalancesJSON(info);
-   // OrdersJSON(info);
-   
-   if(i > 10 || i == 1) {
-     SymbolsJSON(info);
-     i = 1;
-   }
-  
-   return info.Serialize();
+double transformVolume(CJAVal &pos) {
+   double lot_step = SymbolInfoDouble(pos["symbol"].ToStr(), SYMBOL_VOLUME_STEP);
+   return MathRound(pos["volume"].ToDbl() / lot_step) * lot_step;
 }
 
-void Buy(CJAVal &pos) {
+CJAVal result_to_json(MqlTradeResult &result) {
+   CJAVal info;
+   info["id"] = int(result.request_id);
+   info["code"] = int(result.retcode);
+   info["deal"] = int(result.deal);
+   info["order"] = int(result.order);
+   info["volume"] = result.volume;
+   info["price"] = result.price;
+   info["comment"] = result.comment;
+   return info;
+}
+
+CJAVal Buy(CJAVal &pos) {
    //--- declare and initialize the trade request and result of trade request
    MqlTradeRequest request={0};
    MqlTradeResult  result={0};
    //--- parameters of request
    request.action   = TRADE_ACTION_DEAL;                     // type of trade operation
+   
    request.symbol   = pos["symbol"].ToStr();                 // symbol
-   request.volume   = pos["volume"].ToDbl();                 // volume
+   request.volume   = transformVolume(pos);                  // volume
    request.type     = ORDER_TYPE_BUY;                        // order type
-   request.price    = SymbolInfoDouble(request.symbol,SYMBOL_ASK); // price for opening
+   request.price    = SymbolInfoDouble(request.symbol, SYMBOL_ASK); // price for opening
    request.deviation= 5;                                     // allowed deviation from the price
    request.magic    = EXPERT_MAGIC;                          // MagicNumber of the order
+   request.type_filling = ORDER_FILLING_IOC;
+   request.type_time = ORDER_TIME_DAY;
 
    if(pos.HasKey("comment"))
       request.comment = pos["comment"].ToStr();
@@ -160,20 +249,23 @@ void Buy(CJAVal &pos) {
       PrintFormat("OrderSend error %d",GetLastError());     // if unable to send the request, output the error code
    //--- information about the operation
    PrintFormat("retcode=%u  deal=%I64u  order=%I64u",result.retcode,result.deal,result.order);
+   return result_to_json(result);
 }
 
-void Short(CJAVal &pos) {
+CJAVal Short(CJAVal &pos) {
    //--- declare and initialize the trade request and result of trade request
    MqlTradeRequest request={0};
    MqlTradeResult  result={0};
    //--- parameters of request
    request.action   = TRADE_ACTION_DEAL;                     // type of trade operation
    request.symbol   = pos["symbol"].ToStr();                 // symbol
-   request.volume   = pos["volume"].ToDbl();                 // volume
+   request.volume   = transformVolume(pos);                  // volume
    request.type     = ORDER_TYPE_SELL;                       // order type
    request.price    = SymbolInfoDouble(request.symbol,SYMBOL_BID); // price for opening
    request.deviation= 5;                                     // allowed deviation from the price
    request.magic    = EXPERT_MAGIC;                          // MagicNumber of the order
+   request.type_filling = ORDER_FILLING_IOC;
+   request.type_time = ORDER_TIME_DAY;
    
    if(pos.HasKey("comment"))
       request.comment = pos["comment"].ToStr();
@@ -181,15 +273,143 @@ void Short(CJAVal &pos) {
       request.magic = pos["magic"].ToInt();
    
    //--- send the request
-   if(!OrderSend(request,result))
+   if(!OrderSend(request, result))
       PrintFormat("OrderSend error %d",GetLastError());     // if unable to send the request, output the error code
    //--- information about the operation
    PrintFormat("retcode=%u  deal=%I64u  order=%I64u",result.retcode,result.deal,result.order);
+   return result_to_json(result);
+}
+ 
+CJAVal Close(CJAVal &pos) {
+   CTrade trade;
+   CJAVal info;
+   info["success"] = trade.PositionClose(pos["id"].ToInt());
+
+   return info;
 }
 
-void Close(CJAVal &pos) {
-   CTrade trade;
-   trade.PositionClose(pos["id"].ToInt());
+// Create trailing tp
+CJAVal TrailingTp(CJAVal &data) {
+   CJAVal info;
+
+   // Validate input data
+   // ToDo add ability to exprime offset in percent
+   if(!data.HasKey("id") || !data["id"].IsNumeric()) {
+      info["error"] = "No valid id provided";
+      return info;
+   } else if (!data.HasKey("trigger") || !data["trigger"].IsNumeric()) {
+      info["error"] = "No valid trigger provided";
+      return info;
+   } else if (!data.HasKey("offset") || !data["offset"].IsNumeric()) {
+      info["error"] = "No valid offset provided";
+      return info;
+   }
+
+   // Select position id and verify if position exists
+   int id = int(data["id"].ToInt());
+   if(!PositionSelectByTicket(id)) {
+      info["error"] = "Position not found";
+      return info;
+   }
+
+   string symbol   = PositionGetString(POSITION_SYMBOL);
+   bool is_long    = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+   data["is_long"] = is_long;
+   data["symbol"]  = symbol;
+
+   // Handle initial trigger value
+   // If we don't require to trigger from current timestamp, check if tp already reached in past data
+   if(!data.HasKey("from_current_timestamp") || !data["from_current_timestamp"].ToBool()) {
+      int ellapsed_time = int((TimeCurrent() - PositionGetInteger(POSITION_TIME)) / 60);
+
+      if(is_long) {
+         int highIndex  = iHighest(symbol, PERIOD_M1, MODE_HIGH, ellapsed_time, 0);
+         double highest = iHigh(symbol, PERIOD_M1, highIndex);
+
+         if(highest >= data["trigger"].ToDbl()) {
+            data["trigger"] = highest;
+            data["triggered"] = true;
+         }
+      } else {
+         int lowIndex  = iLowest(symbol, PERIOD_M1, MODE_LOW, ellapsed_time, 0);
+         double lowest = iLow(symbol, PERIOD_M1, lowIndex);
+
+         if(lowest <= data["trigger"].ToDbl()) {
+            data["trigger"] = lowest;
+            data["triggered"] = true;
+         }
+      }
+   }
+
+   // Replace tp in list if already exists
+   for(int x=0; x<trailing_tps.Size(); x++) {
+      if(trailing_tps[x]["id"].ToInt() == id) {
+         data["action"] = "replaced";
+         trailing_tps[x].Set(data);
+         info.Set(trailing_tps[x]);
+         return info;
+      }
+   }
+
+   // Add tp to list if not present yet
+   data["action"] = "created";
+   trailing_tps.Add(data);
+   info.Set(data);
+   return info;
+}
+
+//----------------------------------------------
+// Communication protocol
+
+CJAVal OnCommand(string action, CJAVal &data) {
+
+   if(action == "buy") {
+      return Buy(data);
+   } else if(action == "short") {
+      return Short(data);
+   } else if(action == "close") {
+      return Close(data);
+   } else if(action == "history") {
+      return History(data, 250);
+   } else if(action == "trailing_tp") {
+      return TrailingTp(data);
+   }
+
+   CJAVal err;
+   err["error"] = "Unknown action " + action + " received";
+   return err;
+}
+
+//---------------------------
+
+CJAVal commands;
+
+string NotifyJSONData() {
+   isymbol++;
+ 
+   //Prepare meta data
+   CJAVal meta;
+ 
+   meta["enabled"] = MQLInfoInteger(MQL_TRADE_ALLOWED) && TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
+   PositionsJSON(meta);
+   BalancesJSON(meta);
+ 
+   if(isymbol > 10 || isymbol == 1) {
+     SymbolsJSON(meta);
+     isymbol = 1;
+   }
+
+   // Add meta command
+   CJAVal metaCommand;
+   metaCommand["action"] = "meta";
+   metaCommand["data"].Set(meta);
+
+   commands.Add(metaCommand);
+
+   // Serialize commands data
+   string data = commands.Serialize();
+   commands.Clear();
+   return data;
 }
 
 void notifyData() {
@@ -211,28 +431,18 @@ void notifyData() {
    // Parse response
    CJAVal jv;
    jv.Deserialize(result);
- 
-   // Execute buy orders from request response
-   if(jv.HasKey("buy")) {
-      CJAVal pos = jv["buy"];
-      for(int x = 0; x < pos.Size(); x++) {
-         Buy(pos[x]);
-      }
+
+   for(int x = 0; x < jv.Size(); x++) {
+      CJAVal cmd = jv[x];
+      CJAVal r = OnCommand(cmd["action"].ToStr(), cmd["data"]);
+
+      CJAVal cmdRes;
+      cmdRes["id"] = cmd["id"];
+      cmdRes["data"].Set(r);
+      commands.Add(cmdRes);
    }
 
-   // Execute short orders from request response
-   if(jv.HasKey("short")) {
-      CJAVal pos = jv["short"];
-      for(int x = 0; x < pos.Size(); x++) {
-         Short(pos[x]);
-      }
-   }
-
-   // Execute positions closing from request response
-   if(jv.HasKey("close")) {
-      CJAVal pos = jv["close"];
-      for(int x = 0; x < pos.Size(); x++) {
-         Close(pos[x]);
-      }
+   if(commands.Size() > 0) {
+      notifyData();
    }
 }
