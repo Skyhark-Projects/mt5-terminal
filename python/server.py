@@ -176,6 +176,29 @@ def close_position():
 
 # ----------------------------------------------------------------
 
+#@app.route('/backtest/sl_tp/<string:symbol>', methods = ['POST'])
+#def backtest_sl_tp(symbol):
+#   authorized()
+#   data = json.loads(request.get_data())
+#   
+#   if "unix" not in data or "long" not in data or "tp" not in data or "sl" not in data or "trail" not in data or "trail_offset" not in data:
+#   	return jsonify({ "error": "Please provide all required variables: unix, long, tp, sl, trail, trail_offset" })
+# 
+#   return jsonify({
+#   	"test": data
+#   })
+
+@app.route('/ticks/history/<string:symbol>/<int:from_unix>/<int:to_unix>')
+def ticks_history(symbol, from_unix, to_unix):
+  authorized()
+  res = MT5CopyTicksRange(symbol, datetime.fromtimestamp(from_unix), datetime.fromtimestamp(to_unix), MT5_COPY_TICKS_INFO)
+  if len(res) > 100000:
+  	res = res[:100000]
+
+  return jsonify(res)
+
+# ----------------------------------------------------------------
+
 # Create pipe stream that allows commands to be send throught http requests
 # When the MT5 terminals makes an http request to our server, the answer will not be send until the next http request is received or until we wants to send a command to MT5
 class Pipe:

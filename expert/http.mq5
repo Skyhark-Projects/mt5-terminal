@@ -53,7 +53,8 @@ void OnTick() {
          }
 
          if(triggeredRate != -1 && current_price <= triggeredRate-tp["offset"].ToDbl()) {
-            Print("Long Trailing TP triggered " + tp["id"].ToStr());
+            Print("Long Trailing TP triggered " + tp["id"].ToStr() + " " + tp["symbol"].ToStr());
+            tp["comment"] = "[trailing tp]";
             Close(tp);
          }
       } else {
@@ -65,12 +66,14 @@ void OnTick() {
             tp["trigger"]   = current_price;
             tp["triggered"] = true;
             triggeredRate   = current_price;
-         } else if(tp.HasKey("triggered") && tp["triggered"].ToBool()) {
+         } else if(tp.HasKey("triggered") && tp["triggered"].ToBool()) {;
             triggeredRate = trigger;
          }
 
          if(triggeredRate != -1 && current_price >= triggeredRate+tp["offset"].ToDbl()) {
-            Print("Short Trailing TP triggered " + tp["id"].ToStr());
+            // PrintFormat("Lowested reached=%f, current=%f, offset=%f", triggeredRate, current_price, triggeredRate+tp["offset"].ToDbl());
+            Print("Short Trailing TP triggered " + tp["id"].ToStr() + " " + tp["symbol"].ToStr());
+            tp["comment"] = "[trailing tp]";
             Close(tp);
          }
       }
@@ -199,6 +202,9 @@ CJAVal History(CJAVal &data, int limit) {
    for(int i=0;i<positionsTotal;i++){
      ResetLastError();
      int ticket = int(HistoryDealGetTicket(i));
+     if(start > HistoryDealGetInteger(ticket, DEAL_TIME))
+       continue;
+
      info.Add( HistoryItem(ticket) );
 
      count++;
@@ -340,8 +346,55 @@ CJAVal Short(CJAVal &pos) {
 
 CJAVal Close(CJAVal &pos) {
    int timeBeforeExec = TimeCurrent();
-   CTrade trade;
    int id = int(pos["id"].ToInt());
+
+   if(!PositionSelectByTicket(id)) {
+      CJAVal info;
+      info["success"] = false;
+      info["error"] = "Ticket not found";
+      return info;
+   }
+
+   MqlTradeRequest m_request={0};
+   MqlTradeResult  result={0};
+   string symbol=PositionGetString(POSITION_SYMBOL);
+
+   if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY) {
+      //--- prepare request for close BUY position
+      m_request.type =ORDER_TYPE_SELL;
+      m_request.price=SymbolInfoDouble(symbol,SYMBOL_BID);
+   } else {
+      //--- prepare request for close SELL position
+      m_request.type =ORDER_TYPE_BUY;
+      m_request.price=SymbolInfoDouble(symbol,SYMBOL_ASK);
+   }
+
+   m_request.action    = TRADE_ACTION_DEAL;
+   m_request.position  = id;
+   m_request.symbol    = symbol;
+   m_request.volume    = PositionGetDouble(POSITION_VOLUME);
+   m_request.magic     = EXPERT_MAGIC;
+   m_request.deviation = 5;
+   m_request.type_filling = ORDER_FILLING_IOC;
+   m_request.type_time = ORDER_TIME_DAY;
+
+   if(pos.HasKey("comment"))
+      m_request.comment = pos["comment"].ToStr();
+   if(pos.HasKey("magic"))
+      m_request.magic = pos["magic"].ToInt();
+
+   if(!OrderSend(m_request, result)) {
+      CJAVal info;
+      info["success"] = false;
+      info["error"] = GetLastError();
+      PrintFormat("Order Close error %d", GetLastError());
+      return info;
+   }
+
+   HistorySelect(timeBeforeExec, TimeCurrent());
+   return HistoryItem(int(result.deal));
+
+   /*CTrade trade;
    if(!trade.PositionClose(id)) {
       CJAVal info;
       info["success"] = false;
@@ -349,7 +402,7 @@ CJAVal Close(CJAVal &pos) {
    }
 
    HistorySelect(timeBeforeExec, TimeCurrent());
-   return HistoryItem(int(trade.ResultDeal()));
+   return HistoryItem(int(trade.ResultDeal()));*/
 }
 
 // Create trailing tp
@@ -383,10 +436,10 @@ CJAVal TrailingTp(CJAVal &data) {
    }
 
    // Attach simple tp / sl
-   if(data.HasKey("sl") || data.HasKey("tp")) {
+   if((data.HasKey("sl") || data.HasKey("tp")) && (data["sl"].ToDbl() > 0 || data["tp"].ToDbl() > 0)) {
       CTrade trade;
       if(!trade.PositionModify(id, data["sl"].ToDbl(), data["tp"].ToDbl())) {
-         Print("Coud not attach sl/tp to position", id);
+         Print("Coud not attach sl/tp to position ", id);
       }
    }
 
@@ -399,7 +452,7 @@ CJAVal TrailingTp(CJAVal &data) {
    // Handle initial trigger value
    // If we don't require to trigger from current timestamp, check if tp already reached in past data
    if((!data.HasKey("from_current_timestamp") || !data["from_current_timestamp"].ToBool()) && data["trigger"].ToDbl() != 0) {
-      int ellapsed_time = int((TimeCurrent() - PositionGetInteger(POSITION_TIME)) / 60);
+      int ellapsed_time = int((TimeCurrent() - PositionGetInteger(POSITION_TIME)) / 60) + 1;
 
       if(is_long) {
          int highIndex  = iHighest(symbol, PERIOD_M1, MODE_HIGH, ellapsed_time, 0);
@@ -410,8 +463,12 @@ CJAVal TrailingTp(CJAVal &data) {
             data["triggered"] = true;
          }
       } else {
+         double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+         double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+         double spread = ask-bid;
+      
          int lowIndex  = iLowest(symbol, PERIOD_M1, MODE_LOW, ellapsed_time, 0);
-         double lowest = iLow(symbol, PERIOD_M1, lowIndex);
+         double lowest = MathRound((iLow(symbol, PERIOD_M1, lowIndex) + spread) * 1000000) / 1000000;
 
          if(lowest <= data["trigger"].ToDbl()) {
             data["trigger"] = lowest;
